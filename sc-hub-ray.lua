@@ -14,6 +14,12 @@
 	  Teleport: quick save, spawn, named waypoints
 	  Visual  : ESP, fullbright, time of day, FOV, unlimited zoom,
 	            post-effect killer, freecam
+	  Aim     : aim lock (camera only, never fires), FOV circle, team /
+	            line-of-sight checks, target part, lead for snipers
+	  Crosshair: custom crosshair (styles, size, gap, colour, outline,
+	            dynamic spread, hide the cursor)
+	  Macro   : record your movement / jumps / camera and replay it
+	            (loop, speed, relative-to-me, named recordings)
 	  Info    : FPS / ping / server info, hotkeys, reset, destroy
 
 	WHAT CLIENT-ONLY MEANS
@@ -54,6 +60,8 @@ local CONFIG = {
 	MaxJump = 300,
 	MaxFlySpeed = 250,
 	MaxFreecamSpeed = 300,
+	MaxRecordSeconds = 300,  -- longest single recording
+	RecordRate = 30,         -- samples per second while recording
 
 	-- Toggle hotkeys (any key not pressed while typing or over a UI box).
 	-- Remove a line to disable that hotkey. Names match the toggles.
@@ -62,6 +70,9 @@ local CONFIG = {
 		Noclip = Enum.KeyCode.N,
 		ESP = Enum.KeyCode.B,
 		Freecam = Enum.KeyCode.P,
+		AimLock = Enum.KeyCode.V,
+		Record = Enum.KeyCode.Y,
+		Play = Enum.KeyCode.U,
 	},
 }
 
@@ -1113,6 +1124,9 @@ local function runClient()
 	local SelfTab = createTab("Self")
 	local TeleportTab = createTab("Teleport")
 	local VisualTab = createTab("Visual")
+	local AimTab = createTab("Aim")
+	local CrosshairTab = createTab("Crosshair")
+	local MacroTab = createTab("Macro")
 	local InfoTab = createTab("Info")
 
 	----------------------------------------------------------------
@@ -2207,6 +2221,1123 @@ local function runClient()
 				if State.Freecam then
 					anchorCharacter()
 				end
+			end
+		end)
+	end
+
+	----------------------------------------------------------------
+	-- AIM TAB: aim lock (moves the camera only - it never fires for you)
+	----------------------------------------------------------------
+
+	do
+		local settings = {
+			HoldToAim = true,      -- lock only while holding right mouse
+			PartName = "Head",
+			Strength = 25,         -- 100 = hard lock, lower = smoother pull
+			Radius = 200,          -- pixels around the crosshair
+			MaxDistance = 1500,    -- studs
+			IgnoreTeammates = true,
+			LineOfSight = true,
+			Lead = false,          -- lead moving targets by bullet travel time
+			BulletSpeed = 800,     -- studs/second
+			ShowCircle = true,
+		}
+
+		local held = false
+		local target = nil
+		local bound = false
+		local statusLabel = nil
+
+		local circle = make("Frame", {
+			Visible = false,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Size = UDim2.fromOffset(settings.Radius * 2, settings.Radius * 2),
+			ZIndex = 5,
+		}, Gui)
+		corner(circle, 1000)
+		make("UIStroke", {
+			Color = THEME.Accent,
+			Thickness = 1.5,
+			Transparency = 0.3,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, circle)
+
+		local function aimOrigin(camera)
+			if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+				return camera.ViewportSize / 2
+			end
+			return UserInputService:GetMouseLocation()
+		end
+
+		local function getPart(character)
+			if settings.PartName == "Head" then
+				return character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
+			elseif settings.PartName == "Torso" then
+				return character:FindFirstChild("UpperTorso")
+					or character:FindFirstChild("Torso")
+					or character:FindFirstChild("HumanoidRootPart")
+			end
+			return character:FindFirstChild("HumanoidRootPart")
+		end
+
+		local function isEnemy(player)
+			if not settings.IgnoreTeammates then
+				return true
+			end
+			local mine = LocalPlayer.Team
+			return not (mine and player.Team == mine)
+		end
+
+		local function hasLineOfSight(camera, part, character)
+			if not settings.LineOfSight then
+				return true
+			end
+
+			local ignore = { character }
+			if LocalPlayer.Character then
+				table.insert(ignore, LocalPlayer.Character)
+			end
+
+			local params = RaycastParams.new()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.FilterDescendantsInstances = ignore
+
+			local origin = camera.CFrame.Position
+			return Workspace:Raycast(origin, part.Position - origin, params) == nil
+		end
+
+		-- Returns pixel distance from the crosshair, or nil when the player isn't a valid target.
+		-- `acquiring` also requires them to be inside the FOV circle.
+		local function evaluate(player, camera, origin, acquiring)
+			if player == LocalPlayer or not isEnemy(player) then
+				return nil
+			end
+
+			local character = player.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			local part = character and getPart(character)
+			if not humanoid or not part or humanoid.Health <= 0 then
+				return nil
+			end
+
+			if (part.Position - camera.CFrame.Position).Magnitude > settings.MaxDistance then
+				return nil
+			end
+
+			local point = camera:WorldToViewportPoint(part.Position)
+			if point.Z <= 0 then
+				return nil
+			end
+
+			local pixels = (Vector2.new(point.X, point.Y) - origin).Magnitude
+			if acquiring and pixels > settings.Radius then
+				return nil
+			end
+
+			if not hasLineOfSight(camera, part, character) then
+				return nil
+			end
+
+			return pixels
+		end
+
+		local function acquire(camera, origin)
+			local best, bestPixels = nil, nil
+			for _, player in ipairs(Players:GetPlayers()) do
+				local pixels = evaluate(player, camera, origin, true)
+				if pixels and (not bestPixels or pixels < bestPixels) then
+					best, bestPixels = player, pixels
+				end
+			end
+			return best
+		end
+
+		local function update(dt)
+			local camera = Workspace.CurrentCamera
+			local origin = aimOrigin(camera)
+
+			circle.Visible = settings.ShowCircle
+			circle.Position = UDim2.fromOffset(origin.X, origin.Y)
+
+			if State.Freecam then
+				target = nil
+				return
+			end
+
+			local touchOnly = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+			local active = held or not settings.HoldToAim or touchOnly
+			if not active then
+				target = nil
+				return
+			end
+
+			if target and not evaluate(target, camera, origin, false) then
+				target = nil
+			end
+			if not target then
+				target = acquire(camera, origin)
+			end
+			if not target then
+				return
+			end
+
+			local part = getPart(target.Character)
+			if not part then
+				target = nil
+				return
+			end
+
+			local aimPoint = part.Position
+			if settings.Lead then
+				local studs = (aimPoint - camera.CFrame.Position).Magnitude
+				aimPoint += part.AssemblyLinearVelocity * (studs / settings.BulletSpeed)
+			end
+
+			local goal = CFrame.lookAt(camera.CFrame.Position, aimPoint)
+			local alpha = 1 - (1 - settings.Strength / 100) ^ (dt * 60)
+			camera.CFrame = camera.CFrame:Lerp(goal, alpha)
+		end
+
+		local function bind()
+			if bound then
+				return
+			end
+			bound = true
+			RunService:BindToRenderStep("ScHubAim", Enum.RenderPriority.Camera.Value + 1, update)
+		end
+
+		local function unbind()
+			if not bound then
+				return
+			end
+			bound = false
+			RunService:UnbindFromRenderStep("ScHubAim")
+			target = nil
+			circle.Visible = false
+		end
+
+		connect(UserInputService.InputBegan, function(input, processed)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 and not processed then
+				held = true
+				target = nil
+			end
+		end)
+
+		connect(UserInputService.InputEnded, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				held = false
+				target = nil
+			end
+		end)
+
+		----------------------------------------------------------------
+		-- UI
+		----------------------------------------------------------------
+
+		AimTab:CreateSection("Aim lock")
+
+		statusLabel = AimTab:CreateLabel("Aim lock is off")
+
+		Toggles.AimLock = AimTab:CreateToggle({
+			Name = "Aim Lock  (pulls the camera onto the nearest target)",
+			CurrentValue = false,
+			Callback = function(enabled)
+				if enabled then
+					bind()
+				else
+					unbind()
+				end
+			end,
+		})
+
+		AimTab:CreateToggle({
+			Name = "Only While Holding Right Mouse",
+			CurrentValue = true,
+			Callback = function(enabled)
+				settings.HoldToAim = enabled
+			end,
+		})
+
+		AimTab:CreateDropdown({
+			Name = "Aim At",
+			Options = { "Head", "Torso", "Root" },
+			CurrentOption = { "Head" },
+			Callback = function(option)
+				settings.PartName = type(option) == "table" and option[1] or option or "Head"
+			end,
+		})
+
+		AimTab:CreateSlider({
+			Name = "Lock Strength  (100 = hard lock)",
+			Range = { 5, 100 },
+			Increment = 5,
+			Suffix = "%",
+			CurrentValue = settings.Strength,
+			Callback = function(value)
+				settings.Strength = value
+			end,
+		})
+
+		AimTab:CreateSection("Targeting")
+
+		AimTab:CreateSlider({
+			Name = "FOV Radius",
+			Range = { 30, 600 },
+			Increment = 10,
+			Suffix = "px",
+			CurrentValue = settings.Radius,
+			Callback = function(value)
+				settings.Radius = value
+				circle.Size = UDim2.fromOffset(value * 2, value * 2)
+			end,
+		})
+
+		AimTab:CreateSlider({
+			Name = "Max Distance",
+			Range = { 100, 3000 },
+			Increment = 50,
+			Suffix = "studs",
+			CurrentValue = settings.MaxDistance,
+			Callback = function(value)
+				settings.MaxDistance = value
+			end,
+		})
+
+		AimTab:CreateToggle({
+			Name = "Ignore Teammates",
+			CurrentValue = true,
+			Callback = function(enabled)
+				settings.IgnoreTeammates = enabled
+			end,
+		})
+
+		AimTab:CreateToggle({
+			Name = "Require Line Of Sight  (no locking through walls)",
+			CurrentValue = true,
+			Callback = function(enabled)
+				settings.LineOfSight = enabled
+			end,
+		})
+
+		AimTab:CreateToggle({
+			Name = "Show FOV Circle",
+			CurrentValue = true,
+			Callback = function(enabled)
+				settings.ShowCircle = enabled
+				if not enabled then
+					circle.Visible = false
+				end
+			end,
+		})
+
+		AimTab:CreateSection("Sniper")
+
+		AimTab:CreateToggle({
+			Name = "Lead Moving Targets",
+			CurrentValue = false,
+			Callback = function(enabled)
+				settings.Lead = enabled
+			end,
+		})
+
+		AimTab:CreateSlider({
+			Name = "Bullet Speed  (for leading)",
+			Range = { 100, 3000 },
+			Increment = 50,
+			Suffix = "studs/s",
+			CurrentValue = settings.BulletSpeed,
+			Callback = function(value)
+				settings.BulletSpeed = value
+			end,
+		})
+
+		task.spawn(function()
+			while Gui.Parent do
+				if not bound then
+					statusLabel:Set("Aim lock is off")
+				elseif target and target.Parent then
+					local _, _, myRoot = getCharacter()
+					local character = target.Character
+					local root = character and character:FindFirstChild("HumanoidRootPart")
+					local studs = (myRoot and root) and math.floor((root.Position - myRoot.Position).Magnitude + 0.5) or 0
+					statusLabel:Set(string.format("Locked on %s  ·  %d studs", target.DisplayName, studs))
+				elseif settings.HoldToAim and not held then
+					statusLabel:Set("Ready  ·  hold right mouse to lock")
+				else
+					statusLabel:Set("Searching for a target...")
+				end
+				task.wait(0.15)
+			end
+		end)
+	end
+
+	----------------------------------------------------------------
+	-- CROSSHAIR TAB: custom on-screen crosshair
+	----------------------------------------------------------------
+
+	do
+		local DEFAULTS = { Style = "Cross", Size = 10, Thickness = 2, Gap = 4, Opacity = 100, R = 255, G = 255, B = 255 }
+
+		local settings = {
+			Enabled = false,
+			Style = DEFAULTS.Style,
+			Size = DEFAULTS.Size,
+			Thickness = DEFAULTS.Thickness,
+			Gap = DEFAULTS.Gap,
+			Opacity = DEFAULTS.Opacity,
+			R = DEFAULTS.R,
+			G = DEFAULTS.G,
+			B = DEFAULTS.B,
+			Outline = true,
+			Dynamic = false,
+			FollowMouse = false,
+		}
+
+		local PRESETS = {
+			White = { 255, 255, 255 },
+			Red = { 255, 60, 60 },
+			Green = { 60, 255, 90 },
+			Cyan = { 0, 220, 255 },
+			Yellow = { 255, 230, 60 },
+			Magenta = { 255, 70, 220 },
+			Orange = { 255, 150, 40 },
+			Black = { 0, 0, 0 },
+		}
+		local PRESET_NAMES = { "White", "Red", "Green", "Cyan", "Yellow", "Magenta", "Orange", "Black" }
+
+		local holder = make("Frame", {
+			Name = "Crosshair",
+			Visible = false,
+			BackgroundTransparency = 1,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(0, 0),
+			ZIndex = 0, -- sits below the hub window
+		}, Gui)
+
+		local parts = {}
+		for _, name in ipairs({ "Top", "Bottom", "Left", "Right", "Dot" }) do
+			local frame = make("Frame", {
+				Name = name,
+				Visible = false,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BorderSizePixel = 0,
+				BackgroundColor3 = Color3.new(1, 1, 1),
+			}, holder)
+			local stroke = make("UIStroke", {
+				Color = Color3.new(0, 0, 0),
+				Thickness = 1,
+				ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			}, frame)
+			parts[name] = { Frame = frame, Stroke = stroke }
+		end
+
+		local ring = make("Frame", {
+			Name = "Ring",
+			Visible = false,
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+		}, holder)
+		corner(ring, 1000)
+		local ringStroke = make("UIStroke", {
+			Thickness = 2,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, ring)
+
+		local extraGap = 0   -- extra spread (px) while moving, when Dynamic Gap is on
+
+		local function place(name, visible, width, height, x, y, color, transparency)
+			local part = parts[name]
+			part.Frame.Visible = visible
+			if visible then
+				part.Frame.Size = UDim2.fromOffset(width, height)
+				part.Frame.Position = UDim2.fromOffset(x, y)
+				part.Frame.BackgroundColor3 = color
+				part.Frame.BackgroundTransparency = transparency
+				part.Stroke.Enabled = settings.Outline
+				part.Stroke.Transparency = transparency
+			end
+		end
+
+		local function apply()
+			local color = Color3.fromRGB(settings.R, settings.G, settings.B)
+			local transparency = 1 - settings.Opacity / 100
+			local thickness = settings.Thickness
+			local length = settings.Size
+			local offset = math.floor(settings.Gap + extraGap + length / 2 + 0.5)
+			local style = settings.Style
+
+			local showLines = style == "Cross" or style == "T-Shape" or style == "Cross + Dot"
+			local showDot = style == "Dot" or style == "Cross + Dot" or style == "Circle + Dot"
+			local showRing = style == "Circle" or style == "Circle + Dot"
+
+			place("Top", showLines and style ~= "T-Shape", thickness, length, 0, -offset, color, transparency)
+			place("Bottom", showLines, thickness, length, 0, offset, color, transparency)
+			place("Left", showLines, length, thickness, -offset, 0, color, transparency)
+			place("Right", showLines, length, thickness, offset, 0, color, transparency)
+
+			local dotSize = math.max(thickness, 2)
+			place("Dot", showDot, dotSize, dotSize, 0, 0, color, transparency)
+
+			ring.Visible = showRing
+			if showRing then
+				ring.Size = UDim2.fromOffset(length * 2, length * 2)
+				ringStroke.Color = color
+				ringStroke.Thickness = thickness
+				ringStroke.Transparency = transparency
+			end
+		end
+
+		connect(RunService.RenderStepped, function()
+			if not settings.Enabled then
+				return
+			end
+
+			local camera = Workspace.CurrentCamera
+			local origin = camera.ViewportSize / 2
+			if settings.FollowMouse and UserInputService.MouseBehavior ~= Enum.MouseBehavior.LockCenter then
+				origin = UserInputService:GetMouseLocation()
+			end
+			holder.Position = UDim2.fromOffset(math.floor(origin.X + 0.5), math.floor(origin.Y + 0.5))
+
+			local targetExtra = 0
+			if settings.Dynamic then
+				local _, _, root = getCharacter()
+				if root then
+					local velocity = root.AssemblyLinearVelocity
+					local speed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+					targetExtra = math.clamp(speed / 16 * 6, 0, 14)
+				end
+			end
+
+			local before = math.floor(extraGap + 0.5)
+			extraGap += (targetExtra - extraGap) * 0.2
+			if math.floor(extraGap + 0.5) ~= before then
+				apply()
+			end
+		end)
+
+		----------------------------------------------------------------
+		-- UI
+		----------------------------------------------------------------
+
+		local styleDropdown, sizeSlider, thicknessSlider, gapSlider, opacitySlider
+		local redSlider, greenSlider, blueSlider
+		local outlineToggle, dynamicToggle, followToggle
+
+		CrosshairTab:CreateSection("Crosshair")
+
+		Toggles.Crosshair = CrosshairTab:CreateToggle({
+			Name = "Enable Custom Crosshair",
+			CurrentValue = false,
+			Callback = function(enabled)
+				settings.Enabled = enabled
+				holder.Visible = enabled
+				if enabled then
+					apply()
+				end
+			end,
+		})
+
+		local originalMouseIcon = UserInputService.MouseIconEnabled
+
+		Toggles.HideMouse = CrosshairTab:CreateToggle({
+			Name = "Hide Mouse Cursor",
+			CurrentValue = false,
+			Callback = function(enabled)
+				UserInputService.MouseIconEnabled = enabled and false or originalMouseIcon
+			end,
+		})
+
+		styleDropdown = CrosshairTab:CreateDropdown({
+			Name = "Style",
+			Options = { "Cross", "T-Shape", "Dot", "Circle", "Cross + Dot", "Circle + Dot" },
+			CurrentOption = { settings.Style },
+			Callback = function(option)
+				settings.Style = type(option) == "table" and option[1] or option or DEFAULTS.Style
+				apply()
+			end,
+		})
+
+		CrosshairTab:CreateSection("Shape")
+
+		sizeSlider = CrosshairTab:CreateSlider({
+			Name = "Size  (line length / circle radius)",
+			Range = { 2, 60 },
+			Increment = 1,
+			Suffix = "px",
+			CurrentValue = settings.Size,
+			Callback = function(value)
+				settings.Size = value
+				apply()
+			end,
+		})
+
+		thicknessSlider = CrosshairTab:CreateSlider({
+			Name = "Thickness",
+			Range = { 1, 8 },
+			Increment = 1,
+			Suffix = "px",
+			CurrentValue = settings.Thickness,
+			Callback = function(value)
+				settings.Thickness = value
+				apply()
+			end,
+		})
+
+		gapSlider = CrosshairTab:CreateSlider({
+			Name = "Center Gap",
+			Range = { 0, 30 },
+			Increment = 1,
+			Suffix = "px",
+			CurrentValue = settings.Gap,
+			Callback = function(value)
+				settings.Gap = value
+				apply()
+			end,
+		})
+
+		opacitySlider = CrosshairTab:CreateSlider({
+			Name = "Opacity",
+			Range = { 10, 100 },
+			Increment = 5,
+			Suffix = "%",
+			CurrentValue = settings.Opacity,
+			Callback = function(value)
+				settings.Opacity = value
+				apply()
+			end,
+		})
+
+		outlineToggle = CrosshairTab:CreateToggle({
+			Name = "Black Outline",
+			CurrentValue = settings.Outline,
+			Callback = function(enabled)
+				settings.Outline = enabled
+				apply()
+			end,
+		})
+
+		dynamicToggle = CrosshairTab:CreateToggle({
+			Name = "Dynamic Gap  (widens while you move)",
+			CurrentValue = settings.Dynamic,
+			Callback = function(enabled)
+				settings.Dynamic = enabled
+				if not enabled then
+					extraGap = 0
+					apply()
+				end
+			end,
+		})
+
+		followToggle = CrosshairTab:CreateToggle({
+			Name = "Follow Mouse  (when the cursor is free)",
+			CurrentValue = settings.FollowMouse,
+			Callback = function(enabled)
+				settings.FollowMouse = enabled
+			end,
+		})
+
+		CrosshairTab:CreateSection("Color")
+
+		CrosshairTab:CreateDropdown({
+			Name = "Color Preset",
+			Options = PRESET_NAMES,
+			CurrentOption = { "White" },
+			Callback = function(option)
+				local name = type(option) == "table" and option[1] or option
+				local preset = name and PRESETS[name]
+				if preset then
+					redSlider:Set(preset[1])
+					greenSlider:Set(preset[2])
+					blueSlider:Set(preset[3])
+				end
+			end,
+		})
+
+		redSlider = CrosshairTab:CreateSlider({
+			Name = "Red",
+			Range = { 0, 255 },
+			Increment = 5,
+			CurrentValue = settings.R,
+			Callback = function(value)
+				settings.R = value
+				apply()
+			end,
+		})
+
+		greenSlider = CrosshairTab:CreateSlider({
+			Name = "Green",
+			Range = { 0, 255 },
+			Increment = 5,
+			CurrentValue = settings.G,
+			Callback = function(value)
+				settings.G = value
+				apply()
+			end,
+		})
+
+		blueSlider = CrosshairTab:CreateSlider({
+			Name = "Blue",
+			Range = { 0, 255 },
+			Increment = 5,
+			CurrentValue = settings.B,
+			Callback = function(value)
+				settings.B = value
+				apply()
+			end,
+		})
+
+		CrosshairTab:CreateButton({
+			Name = "Reset Crosshair Style",
+			Callback = function()
+				styleDropdown:Set(DEFAULTS.Style)
+				sizeSlider:Set(DEFAULTS.Size)
+				thicknessSlider:Set(DEFAULTS.Thickness)
+				gapSlider:Set(DEFAULTS.Gap)
+				opacitySlider:Set(DEFAULTS.Opacity)
+				redSlider:Set(DEFAULTS.R)
+				greenSlider:Set(DEFAULTS.G)
+				blueSlider:Set(DEFAULTS.B)
+				outlineToggle:Set(true)
+				dynamicToggle:Set(false)
+				followToggle:Set(false)
+			end,
+		})
+
+		apply()
+	end
+
+	----------------------------------------------------------------
+	-- MACRO TAB: record & replay your movement (TinyTask-style)
+	----------------------------------------------------------------
+
+	do
+		local SAMPLE_INTERVAL = 1 / CONFIG.RecordRate
+
+		local recordings = {}   -- name -> { Frames = {...}, Duration = seconds }
+		local names = {}
+		local selectedName = nil
+		local typedName = ""
+		local dropdown = nil
+		local nameInput = nil
+		local statusLabel = nil
+
+		local recorder = nil    -- active recording session
+		local playback = nil    -- active playback session
+		local settings = { Loop = false, Speed = 1, Relative = false, Camera = false }
+
+		local function formatTime(seconds)
+			seconds = math.max(0, math.floor(seconds))
+			return string.format("%02d:%02d", seconds // 60, seconds % 60)
+		end
+
+		local function refreshDropdown()
+			table.sort(names, function(a, b)
+				return a:lower() < b:lower()
+			end)
+			dropdown:Refresh(table.clone(names))
+		end
+
+		local function uniqueName()
+			local name = typedName:match("^%s*(.-)%s*$")
+			if name == "" then
+				local number = #names + 1
+				while recordings["Recording " .. number] do
+					number += 1
+				end
+				name = "Recording " .. number
+			end
+			return name
+		end
+
+		----------------------------------------------------------------
+		-- Recording
+		----------------------------------------------------------------
+
+		local function startRecording()
+			local _, humanoid, root = getCharacter()
+			if not humanoid or not root then
+				notify({ Title = CONFIG.Name, Content = "No character to record." })
+				return false
+			end
+
+			recorder = { Frames = {}, Elapsed = 0, Accumulator = SAMPLE_INTERVAL }
+			notify({ Title = CONFIG.Name, Content = "Recording started. Move around, then stop it." })
+			return true
+		end
+
+		local function stopRecording()
+			if not recorder then
+				return
+			end
+
+			local frames = recorder.Frames
+			recorder = nil
+
+			if #frames < 2 then
+				notify({ Title = CONFIG.Name, Content = "That recording was too short to save." })
+				return
+			end
+
+			local startTime = frames[1].t
+			for _, frame in ipairs(frames) do
+				frame.t -= startTime
+			end
+
+			local name = uniqueName()
+			if not recordings[name] then
+				table.insert(names, name)
+			end
+			recordings[name] = { Frames = frames, Duration = frames[#frames].t }
+
+			refreshDropdown()
+			dropdown:Set(name)
+			nameInput:Set("")
+			typedName = ""
+
+			notify({
+				Title = CONFIG.Name,
+				Content = string.format('Saved "%s" (%s).', name, formatTime(recordings[name].Duration)),
+			})
+		end
+
+		connect(RunService.Heartbeat, function(dt)
+			if not recorder then
+				return
+			end
+
+			recorder.Elapsed += dt
+			recorder.Accumulator += dt
+			if recorder.Accumulator < SAMPLE_INTERVAL then
+				return
+			end
+			recorder.Accumulator = recorder.Accumulator % SAMPLE_INTERVAL
+
+			local _, humanoid, root = getCharacter()
+			local camera = Workspace.CurrentCamera
+			if not (humanoid and root and camera) then
+				return
+			end
+
+			table.insert(recorder.Frames, {
+				t = recorder.Elapsed,
+				cf = root.CFrame,
+				vel = root.AssemblyLinearVelocity,
+				cam = root.CFrame:ToObjectSpace(camera.CFrame),
+				jumping = humanoid:GetState() == Enum.HumanoidStateType.Jumping,
+			})
+
+			if recorder.Elapsed >= CONFIG.MaxRecordSeconds then
+				notify({ Title = CONFIG.Name, Content = "Reached the maximum recording length." })
+				Toggles.Record:Set(false)
+			end
+		end)
+
+		----------------------------------------------------------------
+		-- Playback
+		----------------------------------------------------------------
+
+		local function stopPlayback()
+			if not playback then
+				return
+			end
+
+			local session = playback
+			playback = nil
+
+			local _, humanoid, root = getCharacter()
+			if humanoid then
+				humanoid.AutoRotate = session.OldAutoRotate
+			end
+			if root then
+				root.AssemblyLinearVelocity = Vector3.zero
+			end
+
+			if session.ControlsDisabled then
+				local controls = getControls()
+				if controls then
+					controls:Enable(true)
+				end
+			end
+
+			if session.CameraOwned then
+				local camera = Workspace.CurrentCamera
+				camera.CameraType = Enum.CameraType.Custom
+				if humanoid then
+					camera.CameraSubject = humanoid
+				end
+			end
+		end
+
+		local function startPlayback()
+			local recording = selectedName and recordings[selectedName]
+			if not recording then
+				notify({ Title = CONFIG.Name, Content = "Pick a recording first." })
+				return false
+			end
+
+			local _, humanoid, root = getCharacter()
+			if not humanoid or not root then
+				notify({ Title = CONFIG.Name, Content = "No character to play it on." })
+				return false
+			end
+
+			-- These would fight the replay for control of the character / camera.
+			if State.Fly then
+				Toggles.Fly:Set(false)
+			end
+			if State.Freecam then
+				Toggles.Freecam:Set(false)
+			end
+
+			local controls = getControls()
+			local controlsDisabled = false
+			if controls then
+				controls:Disable()
+				controlsDisabled = true
+			end
+
+			local offset = CFrame.identity
+			if settings.Relative then
+				offset = root.CFrame * recording.Frames[1].cf:Inverse()
+			end
+
+			playback = {
+				Name = selectedName,
+				Frames = recording.Frames,
+				Duration = recording.Duration,
+				Time = 0,
+				Index = 1,
+				Offset = offset,
+				WasJumping = false,
+				OldAutoRotate = humanoid.AutoRotate,
+				ControlsDisabled = controlsDisabled,
+				CameraOwned = false,
+				CameraRelative = nil,
+			}
+
+			humanoid.AutoRotate = false
+
+			if settings.Camera then
+				Workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+				playback.CameraOwned = true
+			end
+
+			return true
+		end
+
+		-- Runs before physics each step: place the character where the recording says.
+		connect(RunService.Stepped, function(_, dt)
+			if not playback then
+				return
+			end
+
+			local _, humanoid, root = getCharacter()
+			if not humanoid or not root or humanoid.Health <= 0 then
+				Toggles.Play:Set(false)
+				return
+			end
+
+			local session = playback
+			local frames = session.Frames
+
+			session.Time += dt * settings.Speed
+
+			if session.Time >= session.Duration then
+				if settings.Loop then
+					session.Time = 0
+					session.Index = 1
+					session.WasJumping = false
+				else
+					Toggles.Play:Set(false)
+					notify({ Title = CONFIG.Name, Content = "Playback finished." })
+					return
+				end
+			end
+
+			local index = session.Index
+			while frames[index + 1] and frames[index + 1].t <= session.Time do
+				index += 1
+			end
+			session.Index = index
+
+			local a = frames[index]
+			local b = frames[index + 1] or a
+			local alpha = 0
+			if b.t > a.t then
+				alpha = math.clamp((session.Time - a.t) / (b.t - a.t), 0, 1)
+			end
+
+			root.CFrame = session.Offset * a.cf:Lerp(b.cf, alpha)
+			root.AssemblyLinearVelocity = session.Offset:VectorToWorldSpace(a.vel:Lerp(b.vel, alpha)) * settings.Speed
+
+			if a.jumping and not session.WasJumping then
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+			session.WasJumping = a.jumping
+
+			session.CameraRelative = a.cam:Lerp(b.cam, alpha)
+		end)
+
+		connect(RunService.RenderStepped, function()
+			local session = playback
+			if not session or not session.CameraOwned or not session.CameraRelative then
+				return
+			end
+			local _, _, root = getCharacter()
+			if root then
+				Workspace.CurrentCamera.CFrame = root.CFrame * session.CameraRelative
+			end
+		end)
+
+		----------------------------------------------------------------
+		-- UI
+		----------------------------------------------------------------
+
+		MacroTab:CreateSection("Record")
+
+		statusLabel = MacroTab:CreateLabel("Idle")
+
+		nameInput = MacroTab:CreateInput({
+			Name = "Recording name",
+			PlaceholderText = "optional",
+			RemoveTextAfterFocusLost = false,
+			Callback = function(text)
+				typedName = text or ""
+			end,
+		})
+
+		Toggles.Record = MacroTab:CreateToggle({
+			Name = "Record  (movement, jumps, camera)",
+			CurrentValue = false,
+			Callback = function(enabled)
+				if enabled then
+					if playback then
+						Toggles.Play:Set(false)
+					end
+					if not startRecording() then
+						Toggles.Record:Set(false)
+					end
+				else
+					stopRecording()
+				end
+			end,
+		})
+
+		MacroTab:CreateSection("Playback")
+
+		dropdown = MacroTab:CreateDropdown({
+			Name = "Recording",
+			Options = {},
+			CurrentOption = {},
+			Callback = function(option)
+				selectedName = type(option) == "table" and option[1] or option
+			end,
+		})
+
+		Toggles.Play = MacroTab:CreateToggle({
+			Name = "Play Selected Recording",
+			CurrentValue = false,
+			Callback = function(enabled)
+				if enabled then
+					if recorder then
+						Toggles.Record:Set(false)
+					end
+					if not startPlayback() then
+						Toggles.Play:Set(false)
+					end
+				else
+					stopPlayback()
+				end
+			end,
+		})
+
+		MacroTab:CreateToggle({
+			Name = "Loop Playback",
+			CurrentValue = false,
+			Callback = function(enabled)
+				settings.Loop = enabled
+			end,
+		})
+
+		MacroTab:CreateToggle({
+			Name = "Relative To My Position  (start where I'm standing)",
+			CurrentValue = false,
+			Callback = function(enabled)
+				settings.Relative = enabled
+			end,
+		})
+
+		MacroTab:CreateToggle({
+			Name = "Replay Camera Too",
+			CurrentValue = false,
+			Callback = function(enabled)
+				settings.Camera = enabled
+			end,
+		})
+
+		MacroTab:CreateSlider({
+			Name = "Playback Speed",
+			Range = { 0.25, 3 },
+			Increment = 0.25,
+			Suffix = "x",
+			CurrentValue = 1,
+			Callback = function(value)
+				settings.Speed = value
+			end,
+		})
+
+		MacroTab:CreateButton({
+			Name = "Delete Selected Recording",
+			Callback = function()
+				if not selectedName or not recordings[selectedName] then
+					notify({ Title = CONFIG.Name, Content = "Pick a recording first." })
+					return
+				end
+
+				if playback and playback.Name == selectedName then
+					Toggles.Play:Set(false)
+				end
+
+				local index = table.find(names, selectedName)
+				if index then
+					table.remove(names, index)
+				end
+				recordings[selectedName] = nil
+				selectedName = nil
+				refreshDropdown()
+			end,
+		})
+
+		task.spawn(function()
+			while Gui.Parent do
+				if recorder then
+					statusLabel:Set(string.format(
+						"● Recording  %s  ·  %d frames",
+						formatTime(recorder.Elapsed), #recorder.Frames
+					))
+				elseif playback then
+					statusLabel:Set(string.format(
+						"▶ Playing \"%s\"  %s / %s  ·  %sx",
+						playback.Name, formatTime(playback.Time), formatTime(playback.Duration), tostring(settings.Speed)
+					))
+				else
+					statusLabel:Set(string.format("Idle  ·  %d saved recording(s)", #names))
+				end
+				task.wait(0.25)
+			end
+		end)
+
+		table.insert(Resetters, function()
+			if recorder then
+				Toggles.Record:Set(false)
+			end
+			if playback then
+				Toggles.Play:Set(false)
 			end
 		end)
 	end
